@@ -29,12 +29,15 @@
 //!   details.
 //! - Powerful query interface (the recommended way to find elements) with explicit waits and various predicates
 //! - Component Wrappers (similar to `Page Object Model`)
+//! - Error- and unwind-aware browser-test cleanup via [`testing::run_browser_test`]
 //!
 //! ## Feature Flags
 //!
 //! * `rustls-tls`: (Default) Use rustls to provide TLS support (via reqwest).
 //! * `native-tls`: Use native TLS (via reqwest).
-//! * `component`: (Default) Enable the `Component` derive macro (via thirtyfour-macros).
+//! * `component`: (Default) Enable the `Component` derive macro
+//!   (via thirtyfour-macros) and export [`prelude::Component`] /
+//!   [`prelude::ElementResolver`] from [`prelude`].
 //! * `cdp`: (Default) Typed Chrome DevTools Protocol commands via
 //!   [`WebDriver::cdp`] / [`WebElement::cdp_remote_object_id`] /
 //!   [`WebElement::cdp_backend_node_id`].
@@ -61,20 +64,36 @@
 //!
 //!     // Navigate to https://wikipedia.org.
 //!     driver.goto("https://wikipedia.org").await?;
-//!     let elem_form = driver.find(By::Id("search-form")).await?;
+//!     let elem_form = driver
+//!         .query(By::Id("search-form"))
+//!         .desc("Wikipedia search form")
+//!         .single()
+//!         .await?;
 //!
-//!     // Find element from element.
-//!     let elem_text = elem_form.find(By::Id("searchInput")).await?;
+//!     // Querying from an element scopes the search to its subtree.
+//!     let elem_text = elem_form
+//!         .query(By::Id("searchInput"))
+//!         .desc("Wikipedia search input")
+//!         .single()
+//!         .await?;
 //!
 //!     // Type in the search terms.
 //!     elem_text.send_keys("selenium").await?;
 //!
 //!     // Click the search button.
-//!     let elem_button = elem_form.find(By::Css("button[type='submit']")).await?;
+//!     let elem_button = elem_form
+//!         .query(By::Css("button[type='submit']"))
+//!         .desc("Wikipedia search button")
+//!         .single()
+//!         .await?;
 //!     elem_button.click().await?;
 //!
-//!     // Look for header to implicitly wait for the page to load.
-//!     driver.find(By::ClassName("firstHeading")).await?;
+//!     // Wait for the unique article heading before checking the title.
+//!     driver
+//!         .query(By::ClassName("firstHeading"))
+//!         .desc("Wikipedia article heading")
+//!         .single()
+//!         .await?;
 //!     assert_eq!(driver.title().await?, "Selenium - Wikipedia");
 //!
 //!     // explicitly close the browser.
@@ -111,10 +130,34 @@
 //! [`WebElement::wait_until`]: extensions::query::ElementWaitable::wait_until
 //! [`query`]: extensions::query
 //!
+//! ### Prefer stable selectors
+//!
+//! When you control the application under test, give important elements stable
+//! `data-testid` hooks and select them with [`By::Testid`]:
+//!
+//! ```no_run
+//! # use thirtyfour::prelude::*;
+//! # async fn example(driver: &WebDriver) -> WebDriverResult<()> {
+//! let save_button = driver
+//!     .query(By::Testid("settings-save"))
+//!     .desc("settings save button")
+//!     .single()
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Prefer app-owned test IDs first, then stable semantic CSS selectors. Match
+//! visible text when the copy itself is part of the behavior under test, and
+//! use XPath only when CSS cannot reasonably express the target. Examples
+//! against third-party sites must use the stable selectors those sites expose.
+//!
 //! ### Components
 //!
 //! Components allow you to wrap a web component using smart element resolvers that can
 //! automatically re-query stale elements, and much more.
+//! The default `component` feature makes [`prelude::Component`] and
+//! [`prelude::ElementResolver`] available from [`prelude`].
 //!
 //! ```ignore
 //! #[derive(Debug, Clone, Component)]
@@ -180,13 +223,15 @@ pub use common::{
     requestdata::*,
     types::*,
 };
-pub use web_driver::{WebDriver, WebDriverBuilder};
+pub use web_driver::{WebDriver, WebDriverBuilder, WebDriverRunError};
 pub use web_element::WebElement;
 
 /// Allow importing the common types via `use thirtyfour::prelude::*`.
 pub mod prelude {
     pub use crate::WebDriver;
     pub use crate::WebElement;
+    #[cfg(feature = "component")]
+    pub use crate::components::{Component, ElementResolver};
     pub use crate::error::{WebDriverError, WebDriverResult};
     pub use crate::extensions::query::{ElementPoller, ElementQueryable, ElementWaitable};
     pub use crate::session::scriptret::ScriptRet;
@@ -228,6 +273,8 @@ pub mod manager;
 pub mod session;
 /// Miscellaneous support functions for `thirtyfour` tests.
 pub mod support;
+/// Helpers for running reliable browser tests.
+pub mod testing;
 
 mod js;
 mod switch_to;

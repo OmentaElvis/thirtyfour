@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -42,7 +43,13 @@ impl StdioMode {
 pub(crate) struct SpawnConfig {
     pub host: IpAddr,
     pub ready_timeout: Duration,
+    pub shutdown_timeout: Duration,
     pub stdio: StdioMode,
+    pub args: Vec<OsString>,
+    /// Windows only: skip `CREATE_NO_WINDOW` so the driver gets its own
+    /// console window. Only read on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub show_console_window: bool,
 }
 
 impl Default for SpawnConfig {
@@ -50,7 +57,10 @@ impl Default for SpawnConfig {
         Self {
             host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ready_timeout: Duration::from_secs(30),
+            shutdown_timeout: Duration::from_secs(10),
             stdio: StdioMode::default(),
+            args: Vec::new(),
+            show_console_window: false,
         }
     }
 }
@@ -69,6 +79,7 @@ pub(crate) struct ManagedDriverProcess {
     pub log_subscribers: LogSubscribers,
     /// `None` after `Drop` has run.
     child: Option<Child>,
+    shutdown_timeout: Duration,
     /// Set when shutdown is initiated, so the stdio pump tasks can exit cleanly.
     shutdown: Arc<AtomicBool>,
     /// Handles for the stdout / stderr pump tasks (when stdio is `Tracing`).
@@ -103,10 +114,9 @@ pub(crate) struct SpawnContext<'a> {
 impl ManagedDriverProcess {
     /// Spawn the driver and poll until it reports ready.
     ///
-    /// Retries are only attempted on the narrow case of a port-collision after
-    /// the bind/release dance. Spawn failures (binary not found, exit on
-    /// startup) and readiness timeouts surface immediately — retrying those
-    /// would just multiply the wait by 3x for no benefit.
+    /// Retry port collisions after the bind/release dance up to twice. Chromium
+    /// drivers also get one fresh-process retry after a readiness timeout, once
+    /// the failed child has been killed and reaped. No session exists yet.
     pub(crate) async fn spawn(
         binary: &Path,
         browser: BrowserKind,
@@ -114,19 +124,26 @@ impl ManagedDriverProcess {
         ctx: SpawnContext<'_>,
     ) -> Result<Self, ManagerError> {
         const MAX_PORT_ATTEMPTS: u8 = 3;
-        let mut last_err: Option<ManagerError> = None;
-        for attempt in 0..MAX_PORT_ATTEMPTS {
+        let mut port_attempts = 1;
+        let mut retried_readiness = false;
+        loop {
             let port = pick_port(cfg.host)?;
             match spawn_at_port(binary, browser, cfg, port, &ctx).await {
                 Ok(p) => return Ok(p),
-                Err(e) if is_port_in_use(&e) => {
-                    debug!("driver port {port} already in use (attempt {attempt}): {e}");
-                    last_err = Some(e);
+                Err(e) if is_port_in_use(&e) && port_attempts < MAX_PORT_ATTEMPTS => {
+                    debug!("driver port {port} already in use (attempt {port_attempts}): {e}");
+                    port_attempts += 1;
+                }
+                Err(e @ ManagerError::DriverNotReady(_))
+                    if matches!(browser, BrowserKind::Chrome | BrowserKind::Edge)
+                        && !retried_readiness =>
+                {
+                    warn!(?browser, error = %e, "retrying managed Chromium driver startup once");
+                    retried_readiness = true;
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| ManagerError::Spawn("port allocation exhausted".into())))
     }
 
     /// Connection URL.
@@ -142,6 +159,50 @@ impl ManagedDriverProcess {
         F: Fn(&DriverLogLine) + Send + Sync + 'static,
     {
         self.log_subscribers.add(f)
+    }
+
+    /// Gracefully stop Chromium drivers, falling back to kill and reap.
+    ///
+    /// Only the final session lease reaches this path. Keep the child in self
+    /// until it exits so cancellation still invokes the non-blocking Drop
+    /// fallback. Keep the pipe readers alive until then as well: closing them
+    /// early can terminate a driver on SIGPIPE during its cleanup.
+    ///
+    /// Test-only convenience over [`Self::shutdown_with_budget`]; gated to
+    /// match `shutdown_tests`, its only caller.
+    #[cfg(all(test, unix))]
+    pub(crate) async fn shutdown(self) -> std::io::Result<()> {
+        let budget = self.shutdown_timeout;
+        self.shutdown_with_budget(budget).await
+    }
+
+    pub(crate) async fn shutdown_with_budget(mut self, budget: Duration) -> std::io::Result<()> {
+        let budget = budget.min(self.shutdown_timeout);
+        let url = format!("{}/shutdown", self.url());
+        if let Some(child) = self.child.as_mut() {
+            if matches!(self.browser, BrowserKind::Chrome | BrowserKind::Edge) && !budget.is_zero()
+            {
+                let _ = tokio::time::timeout(budget, async {
+                    if let Ok(client) = reqwest::Client::builder()
+                        .no_proxy()
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                    {
+                        // Some driver versions close the socket while exiting.
+                        // Even on HTTP failure, wait for exit before force-kill.
+                        let _ = client.get(url).send().await;
+                        let _ = child.wait().await;
+                    }
+                })
+                .await;
+            }
+            if child.try_wait()?.is_none() {
+                child.kill().await?;
+            }
+        }
+        self.child.take();
+        // Drop now stops pumps and emits DriverShutdown exactly once.
+        Ok(())
     }
 }
 
@@ -168,11 +229,23 @@ async fn spawn_at_port(
 ) -> Result<ManagedDriverProcess, ManagerError> {
     // chromedriver, geckodriver, msedgedriver, and safaridriver all accept --port=N.
     let mut cmd = Command::new(binary);
+    cmd.args(&cfg.args);
     cmd.arg(format!("--port={port}"));
     cmd.stdout(cfg.stdio.to_stdio());
     cmd.stderr(cfg.stdio.to_stdio());
     cmd.stdin(Stdio::null());
     cmd.kill_on_drop(true);
+
+    // On Windows a console subprocess pops up its own console window whenever
+    // the parent has none (GUI apps built with `windows_subsystem =
+    // "windows"`). Suppress it with CREATE_NO_WINDOW unless the user opted in
+    // via `show_console_window`. Explicitly-set stdio handles still work under
+    // CREATE_NO_WINDOW, so every `StdioMode` behaves the same either way.
+    #[cfg(windows)]
+    if !cfg.show_console_window {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
 
     // chromedriver / msedgedriver bind only to loopback by default; pass
     // --allowed-ips when the user has configured a non-loopback host.
@@ -240,10 +313,13 @@ async fn spawn_at_port(
 
     let ready_started = Instant::now();
     if let Err(e) = wait_until_ready(cfg.host, port, cfg.ready_timeout).await {
-        let _ = child.kill().await;
+        let cleanup = child.kill().await;
         for h in &pump_handles {
             h.abort();
         }
+        cleanup.map_err(|cleanup_error| {
+            ManagerError::Spawn(format!("failed to stop driver after {e}: {cleanup_error}"))
+        })?;
         return Err(e);
     }
     let url = format!("http://{}:{}", cfg.host, port);
@@ -262,6 +338,7 @@ async fn spawn_at_port(
         driver_id: ctx.driver_id,
         log_subscribers,
         child: Some(child),
+        shutdown_timeout: cfg.shutdown_timeout,
         shutdown,
         pump_handles,
         emitter: ctx.emitter.clone(),
@@ -361,8 +438,9 @@ impl Drop for ManagedDriverProcess {
         self.shutdown.store(true, Ordering::Relaxed);
         // Sync drop, so we can't await. `start_kill` issues SIGKILL (or
         // TerminateProcess on Windows) without blocking; `kill_on_drop(true)`
-        // set on the Command ensures the child is reaped asynchronously when
-        // the Child handle drops.
+        // asks Tokio to reap the child on a best-effort basis when the Child
+        // handle drops. Explicit `WebDriver::quit().await` uses `shutdown()`
+        // above and waits for reaping instead.
         if let Some(mut child) = self.child.take()
             && let Err(e) = child.start_kill()
         {
@@ -381,5 +459,293 @@ impl Drop for ManagedDriverProcess {
             version: self.version.clone(),
             port: self.port,
         });
+    }
+}
+
+#[cfg(all(test, unix))]
+mod startup_tests {
+    use super::*;
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn config(timeout: Duration) -> SpawnConfig {
+        SpawnConfig {
+            ready_timeout: timeout,
+            // A real child stays alive without serving /status. The test
+            // controls readiness independently through a local HTTP server.
+            args: vec!["-c".into(), "exec sleep 30".into()],
+            ..SpawnConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn chromium_restarts_after_readiness_timeout_and_reaps_first_child() {
+        for browser in [BrowserKind::Chrome, BrowserKind::Edge] {
+            let emitter = Emitter::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let _subscription = emitter.add(move |event| {
+                if let Status::DriverProcessSpawned {
+                    pid,
+                    port,
+                    ..
+                } = event
+                {
+                    tx.send((*pid, *port)).unwrap();
+                }
+            });
+            let cfg = config(Duration::from_millis(500));
+            let spawn = ManagedDriverProcess::spawn(
+                Path::new("/bin/sh"),
+                browser,
+                &cfg,
+                SpawnContext {
+                    driver_id: DriverId::from_raw(0),
+                    version: "fixture",
+                    emitter: &emitter,
+                    manager_log_subscribers: LogSubscribers::new(),
+                },
+            );
+            let ready_on_retry = async move {
+                let (first_pid, _) = rx.recv().await.unwrap();
+                assert!(process_alive(first_pid));
+                let (second_pid, port) = rx.recv().await.unwrap();
+                assert!(!process_alive(first_pid), "failed child must be reaped before retry");
+                let listener =
+                    tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+                let app = axum::Router::new().route(
+                    "/status",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"value": {"ready": true}}))
+                    }),
+                );
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                (second_pid, server)
+            };
+            let (result, (pid, server)) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(spawn, ready_on_retry)
+            })
+            .await
+            .expect("one failed attempt and one successful attempt must finish");
+            let mut process = result.unwrap();
+            assert!(process.child.as_mut().unwrap().try_wait().unwrap().is_none());
+            process.shutdown_with_budget(Duration::ZERO).await.unwrap();
+            assert!(!process_alive(pid));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn readiness_retry_is_bounded_and_only_for_chromium() {
+        for (browser, expected_attempts) in [
+            (BrowserKind::Chrome, 2),
+            (BrowserKind::Edge, 2),
+            (BrowserKind::Firefox, 1),
+            (BrowserKind::Safari, 1),
+        ] {
+            let emitter = Emitter::new();
+            let pids = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let observed = Arc::clone(&pids);
+            let _subscription = emitter.add(move |event| {
+                if let Status::DriverProcessSpawned {
+                    pid,
+                    ..
+                } = event
+                {
+                    observed.lock().unwrap().push(*pid);
+                }
+            });
+            let result = ManagedDriverProcess::spawn(
+                Path::new("/bin/sh"),
+                browser,
+                &config(Duration::from_millis(10)),
+                SpawnContext {
+                    driver_id: DriverId::from_raw(0),
+                    version: "fixture",
+                    emitter: &emitter,
+                    manager_log_subscribers: LogSubscribers::new(),
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(ManagerError::DriverNotReady(_))));
+            let pids = pids.lock().unwrap();
+            assert_eq!(pids.len(), expected_attempts, "{browser:?}");
+            assert!(pids.iter().all(|pid| !process_alive(*pid)), "all failed children must exit");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shutdown_tests {
+    use super::super::status::Subscription;
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::process::{ChildStdin, ChildStdout};
+
+    struct Fixture {
+        process: ManagedDriverProcess,
+        stdin: ChildStdin,
+        stdout: ChildStdout,
+        events: Arc<AtomicUsize>,
+        _subscription: Subscription,
+    }
+
+    // A controlled child stands in for the driver, exiting only after the
+    // mock HTTP server permits cleanup. No browser, network download, or
+    // timing-dependent browser profile race is needed for these tests.
+    fn fixture(port: u16, timeout: Duration) -> Fixture {
+        let mut child = Command::new("sh")
+            .args(["-c", "read line; printf cleaned"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let emitter = Emitter::new();
+        let events = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&events);
+        let subscription = emitter.add(move |event| {
+            if matches!(event, Status::DriverShutdown { .. }) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        Fixture {
+            process: ManagedDriverProcess {
+                host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                port,
+                browser: BrowserKind::Chrome,
+                version: "fixture".into(),
+                driver_id: DriverId::from_raw(0),
+                log_subscribers: LogSubscribers::new(),
+                child: Some(child),
+                shutdown_timeout: timeout,
+                shutdown: Arc::new(AtomicBool::new(false)),
+                pump_handles: Vec::new(),
+                emitter,
+            },
+            stdin,
+            stdout,
+            events,
+            _subscription: subscription,
+        }
+    }
+
+    async fn read_output(mut stdout: ChildStdout) -> String {
+        let mut output = String::new();
+        tokio::time::timeout(Duration::from_secs(3), stdout.read_to_string(&mut output))
+            .await
+            .expect("child must exit and close stdout")
+            .unwrap();
+        output
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_cleanup_after_response_or_eof() {
+        for respond in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let Fixture {
+                process,
+                mut stdin,
+                stdout,
+                events,
+                _subscription,
+            } = fixture(listener.local_addr().unwrap().port(), Duration::from_secs(3));
+            let shutdown_flag = Arc::clone(&process.shutdown);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                assert_eq!(request, "GET /shutdown HTTP/1.1\r\n");
+                let mut stream = reader.into_inner();
+                if respond {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+                drop(stream);
+                // HTTP completion is not process cleanup completion.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(!shutdown_flag.load(Ordering::Relaxed));
+                stdin.write_all(b"exit\n").await.unwrap();
+            });
+            process.shutdown().await.unwrap();
+            server.await.unwrap();
+            assert_eq!(read_output(stdout).await, "cleaned");
+            assert_eq!(events.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_hanging_request_or_child_and_reaps() {
+        for respond in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let Fixture {
+                process,
+                stdin,
+                stdout,
+                events,
+                _subscription,
+            } = fixture(listener.local_addr().unwrap().port(), Duration::from_millis(100));
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                if respond {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                std::future::pending::<()>().await;
+            });
+            tokio::time::timeout(Duration::from_secs(3), process.shutdown())
+                .await
+                .expect("shutdown must be bounded")
+                .unwrap();
+            // Keep stdin alive: only force-kill, not EOF on stdin, can end child.
+            assert_eq!(read_output(stdout).await, "");
+            assert_eq!(events.load(Ordering::SeqCst), 1);
+            drop(stdin);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_kills_child_and_emits_once() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let Fixture {
+            process,
+            stdin,
+            stdout,
+            events,
+            _subscription,
+        } = fixture(listener.local_addr().unwrap().port(), Duration::from_secs(30));
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let task = tokio::spawn(process.shutdown());
+        tokio::time::timeout(Duration::from_secs(3), accepted_rx).await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(read_output(stdout).await, "");
+        assert_eq!(events.load(Ordering::SeqCst), 1);
+        drop(stdin);
+        server.abort();
     }
 }

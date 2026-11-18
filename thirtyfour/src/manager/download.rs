@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fs4::tokio::AsyncFileExt;
@@ -14,14 +15,17 @@ use super::version::DriverVersion;
 ///
 /// The chromedriver download URL comes fully-qualified from the
 /// Chrome-for-Testing JSON index, so there's no separate base-URL field for
-/// it. Geckodriver version resolution is fully offline (driven by the
-/// embedded compatibility table) so no metadata mirror is needed for it
-/// — only the binary download base.
+/// it. Geckodriver metadata is only needed for [`DriverVersion::Latest`];
+/// other geckodriver versions come from the embedded compatibility table.
 #[derive(Debug, Clone)]
 pub(crate) struct Mirror {
     /// Base URL for the Chrome-for-Testing JSON metadata. Defaults to the
     /// public CfT endpoint.
     pub chrome_metadata: Url,
+    /// Base URL for geckodriver release pages: `<base>latest` must redirect
+    /// to `<base>tag/v<version>`. Defaults to
+    /// `github.com/mozilla/geckodriver/releases/`.
+    pub geckodriver_metadata: Url,
     /// Base URL for geckodriver binary downloads. Defaults to the public
     /// `github.com/mozilla/geckodriver/releases/download/` host.
     pub geckodriver_downloads: Url,
@@ -33,6 +37,8 @@ impl Default for Mirror {
     fn default() -> Self {
         Self {
             chrome_metadata: Url::parse("https://googlechromelabs.github.io/").unwrap(),
+            geckodriver_metadata: Url::parse("https://github.com/mozilla/geckodriver/releases/")
+                .unwrap(),
             geckodriver_downloads: Url::parse(
                 "https://github.com/mozilla/geckodriver/releases/download/",
             )
@@ -95,8 +101,12 @@ pub(crate) async fn resolve_version(
             BrowserKind::Safari => unreachable!("safari short-circuited above"),
         },
         DriverVersion::Latest => match browser {
+            // Offline, the newest driver in the cache stands in for the latest.
+            BrowserKind::Chrome | BrowserKind::Edge | BrowserKind::Firefox if cfg.offline => {
+                newest_cached(cfg, browser, None)?
+            }
             BrowserKind::Chrome => fetch_chrome_latest(client, cfg).await?,
-            BrowserKind::Firefox => firefox_latest_from_table().to_owned(),
+            BrowserKind::Firefox => fetch_firefox_latest(client, cfg).await?,
             BrowserKind::Edge => fetch_edge_latest(client, cfg).await?,
             BrowserKind::Safari => unreachable!("safari short-circuited above"),
         },
@@ -263,6 +273,15 @@ async fn resolve_chrome_exact(
     cfg: &DownloadConfig,
     version: &str,
 ) -> Result<String, ManagerError> {
+    // A full version already in the cache was downloaded from the index, so
+    // fetching the index again would only confirm it.
+    if version.contains('.') && cached_driver_path(cfg, BrowserKind::Chrome, version).exists() {
+        return Ok(version.to_string());
+    }
+    // Without the index, the closest is the newest cached driver of the major.
+    if cfg.offline {
+        return newest_cached(cfg, BrowserKind::Chrome, Some(major(version)));
+    }
     let index = fetch_chrome_index(client, cfg).await?;
     if version.contains('.') {
         // Try exact match; fall back to latest matching the same major if the
@@ -287,14 +306,31 @@ fn sort_semver(a: &str, b: &str) -> std::cmp::Ordering {
     parse(a).cmp(&parse(b))
 }
 
-/// `DriverVersion::Latest` for Firefox — returns the highest geckodriver tag
-/// in the embedded compatibility table. Note that this is "latest known to
-/// this thirtyfour release" rather than "literally the latest from upstream"
-/// — geckodriver releases roughly twice a year, and we do not make a network
-/// call to discover newer versions. Users who need a specific newer release
-/// should use [`DriverVersion::Exact`].
-fn firefox_latest_from_table() -> &'static str {
-    GECKODRIVER_RELEASES.first().expect("GECKODRIVER_RELEASES must not be empty").version
+/// `DriverVersion::Latest` for Firefox: the newest geckodriver release.
+///
+/// Read from where `releases/latest` redirects (`releases/tag/v0.36.0`)
+/// rather than the GitHub REST API, which allows only 60 unauthenticated
+/// requests an hour, and `latest()` resolves on every launch.
+async fn fetch_firefox_latest(
+    client: &reqwest::Client,
+    cfg: &DownloadConfig,
+) -> Result<String, ManagerError> {
+    let url = cfg
+        .mirror
+        .geckodriver_metadata
+        .join("latest")
+        .map_err(|e| ManagerError::Parse(e.to_string()))?;
+    let resp = client.head(url).timeout(cfg.download_timeout).send().await?.error_for_status()?;
+    let release = resp.url();
+    release
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .and_then(|tag| tag.strip_prefix('v'))
+        .filter(|v| v.split('.').all(|p| p.parse::<u32>().is_ok()))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ManagerError::Parse(format!("unexpected geckodriver latest-release URL: {release}"))
+        })
 }
 
 async fn fetch_edge_latest(
@@ -325,6 +361,9 @@ async fn resolve_edge_exact(
     if version.contains('.') {
         return Ok(version.to_string());
     }
+    if cfg.offline {
+        return newest_cached(cfg, BrowserKind::Edge, Some(major(version)));
+    }
     // Major-only request: msedgedriver doesn't expose an index; fetch
     // `LATEST_RELEASE_<major>` from the same host.
     let url = cfg
@@ -347,7 +386,7 @@ async fn resolve_edge_exact(
 fn decode_edge_text(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
         let utf16: Vec<u16> =
-            bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+            bytes[2..].as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect();
         String::from_utf16_lossy(&utf16)
     } else {
         String::from_utf8_lossy(bytes).into_owned()
@@ -388,14 +427,8 @@ pub(crate) async fn ensure_driver(
         return safari_driver_path();
     }
 
-    let platform = match browser {
-        BrowserKind::Chrome | BrowserKind::Firefox => chrome_platform(),
-        BrowserKind::Edge => edge_platform(),
-        BrowserKind::Safari => unreachable!("safari short-circuited above"),
-    };
-    let dir = cfg.cache_dir.join(browser.cache_dir_name()).join(version).join(platform);
-    let bin_name = exe_name(browser);
-    let bin_path = dir.join(&bin_name);
+    let dir = cached_driver_dir(cfg, browser, version);
+    let bin_path = dir.join(exe_name(browser));
 
     if bin_path.exists() {
         emitter.emit(Status::DriverCacheHit {
@@ -449,18 +482,43 @@ pub(crate) async fn ensure_driver(
         path: bin_path.clone(),
     });
 
-    // Make the binary executable on Unix.
-    #[cfg(unix)]
-    if bin_path.exists() {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = tokio::fs::metadata(&bin_path).await?.permissions();
-        perms.set_mode(0o755);
-        tokio::fs::set_permissions(&bin_path, perms).await?;
-    }
-
     Ok(DriverPath {
         binary: bin_path,
     })
+}
+
+/// Cache directory of the driver for `(browser, version)` on this platform.
+fn cached_driver_dir(cfg: &DownloadConfig, browser: BrowserKind, version: &str) -> PathBuf {
+    let platform = match browser {
+        BrowserKind::Chrome | BrowserKind::Firefox => chrome_platform(),
+        BrowserKind::Edge => edge_platform(),
+        BrowserKind::Safari => unreachable!("safari uses the system driver, never cached"),
+    };
+    cfg.cache_dir.join(browser.cache_dir_name()).join(version).join(platform)
+}
+
+/// Where the driver binary for `(browser, version)` is, once downloaded.
+fn cached_driver_path(cfg: &DownloadConfig, browser: BrowserKind, version: &str) -> PathBuf {
+    cached_driver_dir(cfg, browser, version).join(exe_name(browser))
+}
+
+/// The newest driver version with its binary in the cache, of `major_version`
+/// if given. Resolves versions in offline mode, without upstream metadata.
+fn newest_cached(
+    cfg: &DownloadConfig,
+    browser: BrowserKind,
+    major_version: Option<&str>,
+) -> Result<String, ManagerError> {
+    let Ok(entries) = std::fs::read_dir(cfg.cache_dir.join(browser.cache_dir_name())) else {
+        return Err(ManagerError::Offline);
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|version| major_version.is_none_or(|m| major(version) == m))
+        // A directory without the binary is an interrupted download.
+        .filter(|version| cached_driver_path(cfg, browser, version).exists())
+        .max_by(|a, b| sort_semver(a, b))
+        .ok_or(ManagerError::Offline)
 }
 
 /// Locate the system-installed `safaridriver`. Currently only macOS ships one.
@@ -659,6 +717,75 @@ fn is_transient(err: &ManagerError) -> bool {
         || msg.contains("error sending request")
 }
 
+/// Own an unpublished sibling of the final binary, including cleanup on failure.
+struct StagedDriver {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    published: bool,
+}
+
+impl StagedDriver {
+    fn new(target: &Path) -> Result<Self, ManagerError> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let mut name = std::ffi::OsString::from(".");
+            name.push(target.file_name().expect("driver path has a file name"));
+            name.push(format!(".{}.{id}.tmp", std::process::id()));
+            let path = target.with_file_name(name);
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        published: false,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(ManagerError::Io(e)),
+            }
+        }
+    }
+}
+
+impl Drop for StagedDriver {
+    fn drop(&mut self) {
+        // Windows requires closing the write handle before removing the file.
+        drop(self.file.take());
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn publish_driver(
+    reader: &mut impl std::io::Read,
+    target: &Path,
+    expected_size: u64,
+) -> Result<(), ManagerError> {
+    let mut staged = StagedDriver::new(target)?;
+    let out = staged.file.as_mut().expect("staging file is open");
+    let copied = std::io::copy(reader, out).map_err(|e| ManagerError::Extract(e.to_string()))?;
+    // A TAR entry can return EOF without an error when its payload is truncated.
+    // Preserve the declared-size check that tar::Entry::unpack performs.
+    if copied != expected_size {
+        return Err(ManagerError::Extract(format!(
+            "driver binary truncated: expected {expected_size} bytes, copied {copied}"
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        out.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+    }
+    // Close before publication: Windows cannot rename an open writer, and Unix
+    // readers must be able to execute the binary as soon as it becomes visible.
+    drop(staged.file.take());
+    std::fs::rename(&staged.path, target)?;
+    staged.published = true;
+    Ok(())
+}
+
 /// Extract the driver binary for `browser` from a ZIP archive, writing it to
 /// `target_dir`.
 pub(crate) fn extract_zip(
@@ -671,13 +798,12 @@ pub(crate) fn extract_zip(
     let exe = exe_name(browser);
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).map_err(|e| ManagerError::Extract(e.to_string()))?;
-        let entry_name = entry.name().to_string();
+        let entry_name =
+            entry.name().map_err(|e| ManagerError::Extract(e.to_string()))?.into_owned();
         let basename = Path::new(&entry_name).file_name().and_then(|s| s.to_str()).unwrap_or("");
         if basename == exe {
-            let mut out = std::fs::File::create(target_dir.join(&exe)).map_err(ManagerError::Io)?;
-            std::io::copy(&mut entry, &mut out)
-                .map_err(|e| ManagerError::Extract(e.to_string()))?;
-            return Ok(());
+            let size = entry.size();
+            return publish_driver(&mut entry, &target_dir.join(&exe), size);
         }
     }
     Err(ManagerError::Extract(format!(
@@ -751,9 +877,8 @@ fn extract_geckodriver_tar_gz(bytes: &[u8], target_dir: &Path) -> Result<(), Man
         let path = entry.path().map_err(|e| ManagerError::Extract(e.to_string()))?;
         let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
         if basename == exe {
-            let out_path = target_dir.join(&exe);
-            entry.unpack(&out_path).map_err(|e| ManagerError::Extract(e.to_string()))?;
-            return Ok(());
+            let size = entry.size();
+            return publish_driver(&mut entry, &target_dir.join(&exe), size);
         }
     }
     Err(ManagerError::Extract(format!("{exe} not found inside geckodriver archive")))
@@ -775,7 +900,11 @@ fn chrome_platform() -> &'static str {
             "win32"
         }
     } else {
-        "linux64"
+        if cfg!(target_arch = "aarch64") {
+            "linux-arm64"
+        } else {
+            "linux64"
+        }
     }
 }
 
@@ -836,48 +965,213 @@ mod tests {
         assert_eq!(decode_edge_text(bytes).trim(), "126.0.6478.126");
     }
 
-    #[test]
-    fn extract_zip_finds_chromedriver() {
-        // Build an in-memory ZIP containing
-        // `chromedriver-<platform>/chromedriver[.exe]` to mirror real CfT layout.
-        let exe = exe_name(BrowserKind::Chrome);
-        let inner_path = format!("chromedriver-linux64/{exe}");
+    const DRIVER_SCRIPT: &[u8] = b"#!/bin/sh\nprintf 'driver ready\\n'\n";
+    const ORIGINAL_SCRIPT: &[u8] = b"#!/bin/sh\nprintf 'original driver\\n'\n";
 
-        let mut buf = Vec::new();
+    // On Linux, subprocess creation can inherit another test's staging writer
+    // until exec, causing ETXTBSY even after the parent closes its handle. Keep
+    // tests that write and execute fixture drivers in the same serial group.
+
+    fn assert_driver(path: &Path, content: &[u8], expected_stdout: &[u8]) {
+        assert_eq!(std::fs::read(path).unwrap(), content);
+        #[cfg(unix)]
         {
-            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zip.start_file::<_, ()>(&inner_path, Default::default()).unwrap();
-            zip.write_all(b"#!/bin/sh\necho fake driver\n").unwrap();
-            zip.finish().unwrap();
+            let output = std::process::Command::new(path).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, expected_stdout);
         }
+        #[cfg(not(unix))]
+        let _ = expected_stdout;
+    }
 
-        let dir = tempfile::tempdir().unwrap();
-        extract_zip(&buf, dir.path(), BrowserKind::Chrome).unwrap();
+    fn install_original(path: &Path) {
+        std::fs::write(path, ORIGINAL_SCRIPT).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 
-        let extracted = dir.path().join(&exe);
-        assert!(extracted.exists(), "extracted binary should exist at {extracted:?}");
-        let content = std::fs::read(&extracted).unwrap();
-        assert!(content.starts_with(b"#!/bin/sh"));
+    struct PausedReader {
+        inner: std::io::Cursor<&'static [u8]>,
+        paused: Option<std::sync::mpsc::SyncSender<()>>,
+        resume: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl std::io::Read for PausedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.inner.position() < 8 {
+                let len = buf.len().min(8 - self.inner.position() as usize);
+                return std::io::Read::read(&mut self.inner, &mut buf[..len]);
+            }
+            // copy() has written the first chunk before requesting another.
+            if let Some(paused) = self.paused.take() {
+                paused.send(()).unwrap();
+                self.resume.recv().unwrap();
+            }
+            std::io::Read::read(&mut self.inner, buf)
+        }
     }
 
     #[test]
-    fn extract_zip_finds_geckodriver() {
-        // Geckodriver Windows zip layout: binary at archive root.
-        let exe = exe_name(BrowserKind::Firefox);
-        let mut buf = Vec::new();
-        {
-            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-            zip.start_file::<_, ()>(&exe, Default::default()).unwrap();
-            zip.write_all(b"fake geckodriver\n").unwrap();
-            zip.finish().unwrap();
+    #[serial_test::serial(driver_publication)]
+    fn publish_driver_hides_partial_writes_and_preserves_existing_binary() {
+        for existing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join(exe_name(BrowserKind::Chrome));
+            if existing {
+                install_original(&target);
+            }
+            let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    let mut reader = PausedReader {
+                        inner: std::io::Cursor::new(DRIVER_SCRIPT),
+                        paused: Some(paused_tx),
+                        resume: resume_rx,
+                    };
+                    publish_driver(&mut reader, &target, DRIVER_SCRIPT.len() as u64)
+                });
+                paused_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                // Release the writer even if observing the cache detects a bug.
+                let observed = std::fs::read(&target);
+                let original_output = if existing {
+                    #[cfg(unix)]
+                    {
+                        Some(std::process::Command::new(&target).output())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None::<std::io::Result<std::process::Output>>
+                    }
+                } else {
+                    None
+                };
+                resume_tx.send(()).unwrap();
+                writer.join().unwrap().unwrap();
+                if existing {
+                    assert_eq!(observed.unwrap(), ORIGINAL_SCRIPT);
+                    if let Some(output) = original_output {
+                        let output = output.unwrap();
+                        assert!(output.status.success());
+                        assert_eq!(output.stdout, b"original driver\n");
+                    }
+                } else {
+                    assert_eq!(observed.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+                }
+            });
+            assert_driver(&target, DRIVER_SCRIPT, b"driver ready\n");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
+    }
 
+    struct FailingReader(std::io::Cursor<&'static [u8]>);
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.position() == self.0.get_ref().len() as u64 {
+                return Err(std::io::Error::other("injected read failure"));
+            }
+            std::io::Read::read(&mut self.0, buf)
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(driver_publication)]
+    fn publish_driver_read_failure_removes_staging_and_preserves_cache() {
+        for existing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join(exe_name(BrowserKind::Chrome));
+            if existing {
+                install_original(&target);
+            }
+            let mut reader = FailingReader(std::io::Cursor::new(b"partial driver"));
+            assert!(publish_driver(&mut reader, &target, DRIVER_SCRIPT.len() as u64).is_err());
+            if existing {
+                assert_driver(&target, ORIGINAL_SCRIPT, b"original driver\n");
+            } else {
+                assert!(!target.exists());
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), usize::from(existing));
+        }
+    }
+
+    fn zip_fixture(name: &str) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(name, options).unwrap();
+        zip.write_all(DRIVER_SCRIPT).unwrap();
+        zip.finish().unwrap().into_inner()
+    }
+
+    fn tar_fixture() -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(DRIVER_SCRIPT.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, exe_name(BrowserKind::Firefox), DRIVER_SCRIPT).unwrap();
+        tar.into_inner().unwrap()
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(bytes).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    #[serial_test::serial(driver_publication)]
+    fn extract_zip_publishes_complete_executable_for_each_browser() {
+        for (browser, prefix) in [
+            (BrowserKind::Chrome, "chromedriver-linux64/"),
+            (BrowserKind::Edge, ""),
+            (BrowserKind::Firefox, ""),
+        ] {
+            let exe = exe_name(browser);
+            let archive = zip_fixture(&format!("{prefix}{exe}"));
+            let dir = tempfile::tempdir().unwrap();
+            extract_zip(&archive, dir.path(), browser).unwrap();
+            assert_driver(&dir.path().join(exe), DRIVER_SCRIPT, b"driver ready\n");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(driver_publication)]
+    fn extract_tar_gz_publishes_complete_executable() {
         let dir = tempfile::tempdir().unwrap();
-        // This is the regression test for the "extract_geckodriver_zip looked
-        // for chromedriver" bug — exercising the unified extract_zip with the
-        // Firefox kind must succeed.
-        extract_zip(&buf, dir.path(), BrowserKind::Firefox).unwrap();
-        assert!(dir.path().join(&exe).exists());
+        extract_geckodriver_tar_gz(&gzip(&tar_fixture()), dir.path()).unwrap();
+        assert_driver(
+            &dir.path().join(exe_name(BrowserKind::Firefox)),
+            DRIVER_SCRIPT,
+            b"driver ready\n",
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn extract_corrupt_zip_does_not_publish_or_leave_staging_files() {
+        let mut archive = zip_fixture(&exe_name(BrowserKind::Chrome));
+        let payload_offset =
+            archive.windows(DRIVER_SCRIPT.len()).position(|bytes| bytes == DRIVER_SCRIPT).unwrap();
+        archive[payload_offset] ^= 1; // Payload no longer matches the archive's CRC.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(extract_zip(&archive, dir.path(), BrowserKind::Chrome).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn extract_truncated_tar_gz_does_not_publish_or_leave_staging_files() {
+        let mut archive = tar_fixture();
+        // Keep the valid header and only part of the declared file payload.
+        archive.truncate(512 + 8);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(extract_geckodriver_tar_gz(&gzip(&archive), dir.path()).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
@@ -904,13 +1198,6 @@ mod tests {
         assert_eq!(geckodriver_for_firefox("50.0"), None);
         // Garbage parses as 0 → no entry covers it.
         assert_eq!(geckodriver_for_firefox("nonsense"), None);
-    }
-
-    #[test]
-    fn firefox_latest_is_table_head() {
-        // Sanity: `Latest` for Firefox returns the highest entry, which is the
-        // first element of the table.
-        assert_eq!(firefox_latest_from_table(), "0.36.0");
     }
 
     #[test]
@@ -941,5 +1228,111 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = extract_zip(&buf, dir.path(), BrowserKind::Chrome).unwrap_err();
         assert!(matches!(err, ManagerError::Extract(_)));
+    }
+
+    /// A cache holding drivers of `versions`, with mirrors nothing listens on,
+    /// so any metadata fetch fails.
+    fn cache_with(
+        browser: BrowserKind,
+        versions: &[&str],
+        offline: bool,
+    ) -> (tempfile::TempDir, DownloadConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        let nowhere = Url::parse("http://127.0.0.1:1/").unwrap();
+        let cfg = DownloadConfig {
+            cache_dir: dir.path().to_path_buf(),
+            mirror: Mirror {
+                chrome_metadata: nowhere.clone(),
+                geckodriver_metadata: nowhere.clone(),
+                geckodriver_downloads: nowhere.clone(),
+                edge_downloads: nowhere,
+            },
+            download_timeout: Duration::from_secs(5),
+            offline,
+        };
+        for version in versions {
+            let binary = cached_driver_path(&cfg, browser, version);
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(binary, b"").unwrap();
+        }
+        (dir, cfg)
+    }
+
+    async fn resolve(
+        cfg: &DownloadConfig,
+        browser: BrowserKind,
+        spec: DriverVersion,
+        local: Option<&str>,
+    ) -> Result<String, ManagerError> {
+        resolve_version(&reqwest::Client::new(), cfg, browser, &spec, local, None, &Emitter::new())
+            .await
+    }
+
+    #[tokio::test]
+    async fn cached_chrome_version_resolves_without_index() {
+        let (_dir, cfg) = cache_with(BrowserKind::Chrome, &["126.0.6478.126"], false);
+        let local = |v: &'static str| {
+            resolve(&cfg, BrowserKind::Chrome, DriverVersion::MatchLocalBrowser, Some(v))
+        };
+
+        assert_eq!(local("126.0.6478.126").await.unwrap(), "126.0.6478.126");
+        // Not in the cache: online, that still takes the index.
+        assert!(matches!(local("126.0.6478.10").await, Err(ManagerError::Http(_))));
+    }
+
+    #[tokio::test]
+    async fn offline_resolves_chrome_from_cache() {
+        let (_dir, cfg) = cache_with(
+            BrowserKind::Chrome,
+            &["126.0.6478.10", "126.0.6478.126", "127.0.6533.50"],
+            true,
+        );
+        // A directory without the binary, as an interrupted download leaves it.
+        std::fs::create_dir_all(cached_driver_dir(&cfg, BrowserKind::Chrome, "128.0.6613.0"))
+            .unwrap();
+        let local = |v: &'static str| {
+            resolve(&cfg, BrowserKind::Chrome, DriverVersion::MatchLocalBrowser, Some(v))
+        };
+
+        assert_eq!(local("126.0.6478.10").await.unwrap(), "126.0.6478.10");
+        // Not cached exactly: the newest driver of the major.
+        assert_eq!(local("126.0.6478.99").await.unwrap(), "126.0.6478.126");
+        assert!(matches!(local("128.0.6613.0").await, Err(ManagerError::Offline)));
+
+        let exact = resolve(&cfg, BrowserKind::Chrome, DriverVersion::Exact("126".into()), None);
+        assert_eq!(exact.await.unwrap(), "126.0.6478.126");
+        let latest = resolve(&cfg, BrowserKind::Chrome, DriverVersion::Latest, None);
+        assert_eq!(latest.await.unwrap(), "127.0.6533.50");
+    }
+
+    #[tokio::test]
+    async fn offline_resolves_edge_from_cache() {
+        let (_dir, cfg) = cache_with(BrowserKind::Edge, &["126.0.2592.56", "126.0.2592.102"], true);
+
+        let major = resolve(&cfg, BrowserKind::Edge, DriverVersion::Exact("126".into()), None);
+        assert_eq!(major.await.unwrap(), "126.0.2592.102");
+        let latest = resolve(&cfg, BrowserKind::Edge, DriverVersion::Latest, None);
+        assert_eq!(latest.await.unwrap(), "126.0.2592.102");
+        let missing = resolve(&cfg, BrowserKind::Edge, DriverVersion::Exact("127".into()), None);
+        assert!(matches!(missing.await, Err(ManagerError::Offline)));
+        // No chromedriver in the cache at all.
+        let chrome = resolve(&cfg, BrowserKind::Chrome, DriverVersion::Latest, None);
+        assert!(matches!(chrome.await, Err(ManagerError::Offline)));
+    }
+
+    #[tokio::test]
+    async fn offline_resolves_firefox_latest_from_cache() {
+        let latest = |cfg| resolve(cfg, BrowserKind::Firefox, DriverVersion::Latest, None);
+
+        // Older than the newest geckodriver in the compatibility table.
+        let (_dir, cfg) = cache_with(BrowserKind::Firefox, &["0.35.0"], true);
+        assert_eq!(latest(&cfg).await.unwrap(), "0.35.0");
+
+        let (_dir, cfg) = cache_with(BrowserKind::Firefox, &["0.34.0", "0.35.0"], true);
+        std::fs::create_dir_all(cached_driver_dir(&cfg, BrowserKind::Firefox, "0.36.0")).unwrap();
+        assert_eq!(latest(&cfg).await.unwrap(), "0.35.0");
+
+        let (_dir, cfg) = cache_with(BrowserKind::Firefox, &[], true);
+        assert!(matches!(latest(&cfg).await, Err(ManagerError::Offline)));
     }
 }

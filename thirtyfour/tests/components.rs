@@ -6,7 +6,6 @@ mod feature_component {
     use assert_matches::assert_matches;
     use rstest::rstest;
     use std::time::Instant;
-    use thirtyfour::components::{Component, ElementResolver};
     use thirtyfour::error::WebDriverErrorInner;
     use thirtyfour::extensions::query::ElementQueryOptions;
     use thirtyfour::support::block_on;
@@ -48,6 +47,37 @@ mod feature_component {
 
             Ok(())
         }
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Component)]
+    struct EveryBySelectorComponent {
+        base: WebElement,
+        #[by(id = "id")]
+        by_id: ElementResolver<WebElement>,
+        #[by(xpath = ".//a")]
+        by_xpath: ElementResolver<WebElement>,
+        #[by(link = "exact")]
+        by_link_text: ElementResolver<WebElement>,
+        #[by(partial_link = "partial")]
+        by_partial_link_text: ElementResolver<WebElement>,
+        #[by(name = "name")]
+        by_name: ElementResolver<WebElement>,
+        #[by(tag = "a")]
+        by_tag: ElementResolver<WebElement>,
+        #[by(class = "class")]
+        by_class_name: ElementResolver<WebElement>,
+        #[by(css = "a[href]")]
+        by_css: ElementResolver<WebElement>,
+        #[by(testid = "test-id")]
+        by_testid: ElementResolver<WebElement>,
+    }
+
+    #[test]
+    fn component_derive_supports_every_by_selector() {
+        fn assert_component<T: thirtyfour::components::Component>() {}
+
+        assert_component::<EveryBySelectorComponent>();
     }
 
     #[rstest]

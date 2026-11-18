@@ -18,7 +18,8 @@ async fn main() -> WebDriverResult<()> {
 ```
 
 The first run downloads a matching driver into your system cache
-directory; subsequent runs reuse the cached binary. The driver
+directory; subsequent runs reuse the cached binary, without looking up
+upstream metadata when it's the exact version they need. The driver
 subprocess starts when you create the session and is torn down when
 your last `WebDriver` handle drops.
 
@@ -64,8 +65,9 @@ let driver = WebDriver::managed(caps)
 > **Note on Firefox:** Firefox releases and `geckodriver` releases don't
 > share version numbers (Firefox is on `150.x` while `geckodriver` is on
 > `0.36.0`). The manager picks a compatible `geckodriver` from an embedded
-> compatibility table. For `.exact(...)` on Firefox, pass a `geckodriver`
-> tag like `"0.36.0"` — not a Firefox version.
+> compatibility table; `.latest()` takes the newest `geckodriver` release
+> instead. For `.exact(...)` on Firefox, pass a `geckodriver` tag like
+> `"0.36.0"` — not a Firefox version.
 
 ## Sharing One Manager Across Sessions
 
@@ -90,7 +92,11 @@ let firefox = manager.launch(DesiredCapabilities::firefox()).await?;
 A single manager can drive any combination of supported browsers; it
 spawns one driver subprocess per `(browser, version, host)` combination
 as needed, and reuses an existing subprocess when a later `.launch()`
-call matches one that's still alive.
+call matches one that's still alive. It also resolves each driver
+version only once, so later launches skip the upstream metadata lookup.
+The exception is `.latest()`, which checks upstream on every launch so
+that it always picks the current release; in offline mode it rescans the
+cache instead.
 
 ## Configuration
 
@@ -104,6 +110,7 @@ The most useful builder methods (all available on both
 | `.from_caps()`                    | Read `browserVersion` from the capabilities.          |
 | `.exact("126")`                   | Pin a specific driver version.                        |
 | `.driver_binary(browser, path)`   | Use an already-installed driver binary; skip the download/cache flow for that browser. |
+| `.driver_arg(browser, arg)`       | Append an argument to that browser's driver process.  |
 | `.cache_dir(path)`                | Override the on-disk driver cache.                    |
 | `.host(addr)`                     | Bind the driver to an address other than `127.0.0.1`. |
 | `.download_timeout(d)`            | Cap upstream metadata + download time (default 60s).  |
@@ -114,6 +121,32 @@ The most useful builder methods (all available on both
 | `.on_driver_log(fn)`              | Attach a permanent driver-log subscriber.             |
 
 The default cache directory is `<system cache dir>/thirtyfour/drivers`.
+
+### Driver Arguments
+
+Use `.driver_arg()` for driver-server options such as ChromeDriver's
+`--verbose`. Arguments in capabilities configure the browser itself.
+Repeated calls append arguments in order, only for the specified browser;
+each argument is passed directly without shell expansion or splitting.
+Do not override manager-controlled flags such as `--port`, `--allowed-ips`,
+or `--websocket-port`.
+
+```rust
+# use thirtyfour::prelude::*;
+# use thirtyfour::manager::{BrowserKind, StdioMode};
+# async fn run() -> WebDriverResult<()> {
+let driver = WebDriver::managed(DesiredCapabilities::chrome())
+    .driver_arg(BrowserKind::Chrome, "--verbose")
+    .stdio(StdioMode::Inherit)
+    .await?;
+driver.quit().await?;
+# Ok(()) }
+```
+
+`StdioMode::Inherit` displays driver output in the parent terminal. With
+the default `StdioMode::Tracing`, output goes to `tracing` at debug level
+and to `.on_driver_log()` subscribers. Register a callback on the builder
+to capture startup logs before a session exists.
 
 ## Using A Pre-Installed Driver
 
@@ -152,8 +185,22 @@ let driver = manager.launch(DesiredCapabilities::chrome()).await?;
 # Ok(()) }
 ```
 
-In offline mode, a cache miss returns an error rather than reaching out
-to the network.
+In offline mode the manager doesn't fetch upstream metadata:
+
+- Chrome uses the exact cached version if present, otherwise the newest
+  cached driver of the same major.
+- Edge major-only versions select the newest cached driver of that major;
+  full versions must be cached exactly.
+- Firefox requires the literal geckodriver tag from `.exact(...)`, or the
+  version selected by the embedded compatibility table for browser-matching
+  modes, to be cached.
+- `.latest()` gets the newest cached driver.
+
+When nothing in the cache fits, the launch returns an error rather than
+reaching out to the network.
+
+> **Warning:** In offline mode, `.latest()` selects the newest cached
+> driver, which may be older than the latest upstream release.
 
 ## Observing What The Manager Is Doing
 

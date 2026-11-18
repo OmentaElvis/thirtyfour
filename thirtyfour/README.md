@@ -7,13 +7,18 @@
 
 Thirtyfour is a Selenium / WebDriver library for Rust, for automated website UI testing.
 
+Documentation is available as the [Thirtyfour book](https://stevepryde.github.io/thirtyfour/),
+[llms.txt](https://stevepryde.github.io/thirtyfour/llms.txt), and
+[llms-full.txt](https://stevepryde.github.io/thirtyfour/llms-full.txt).
+If you are porting existing automation, start with the
+[Selenium and Playwright translation guide](https://stevepryde.github.io/thirtyfour/tools/selenium-playwright.html).
 
 ## Features
 
 - All W3C WebDriver and WebElement methods supported
 - Create new browser session directly via WebDriver (e.g. chromedriver)
 - Create new browser session via Selenium Standalone or Grid
-- Find elements (via all common selectors e.g. Id, Class, CSS, Tag, XPath)
+- Find elements (via all common selectors e.g. Testid, Id, Class, CSS, Tag, XPath)
 - Send keys to elements, including key-combinations
 - Execute Javascript
 - Action Chains
@@ -26,12 +31,15 @@ Thirtyfour is a Selenium / WebDriver library for Rust, for automated website UI 
 - WebDriver BiDi (W3C bidirectional protocol) — typed commands and event subscription cross-browser, opt-in via the `bidi` feature
 - Powerful query interface (the recommended way to find elements) with explicit waits and various predicates
 - Component Wrappers (similar to `Page Object Model`)
+- Browser-test runner that attempts asynchronous cleanup on errors and panics
 
 ## Feature Flags
 
 - `rustls-tls`: (Default) Use rustls to provide TLS support (via reqwest).
 - `native-tls`: Use native TLS (via reqwest).
-- `component`: (Default) Enable the `Component` derive macro (via thirtyfour_macros).
+- `component`: (Default) Enable the `Component` derive macro (via
+  thirtyfour_macros) and export `Component` / `ElementResolver` from the
+  prelude.
 - `cdp`: (Default) Typed Chrome DevTools Protocol commands.
 - `cdp-events`: WebSocket-backed CDP event subscription.
 - `bidi`: WebDriver BiDi (W3C) — typed commands and event subscription
@@ -54,20 +62,36 @@ async fn main() -> WebDriverResult<()> {
 
      // Navigate to https://wikipedia.org.
      driver.goto("https://wikipedia.org").await?;
-     let elem_form = driver.find(By::Id("search-form")).await?;
+     let elem_form = driver
+         .query(By::Id("search-form"))
+         .desc("Wikipedia search form")
+         .single()
+         .await?;
 
-     // Find element from element.
-     let elem_text = elem_form.find(By::Id("searchInput")).await?;
+     // Querying from an element scopes the search to its subtree.
+     let elem_text = elem_form
+         .query(By::Id("searchInput"))
+         .desc("Wikipedia search input")
+         .single()
+         .await?;
 
      // Type in the search terms.
      elem_text.send_keys("selenium").await?;
 
      // Click the search button.
-     let elem_button = elem_form.find(By::Css("button[type='submit']")).await?;
+     let elem_button = elem_form
+         .query(By::Css("button[type='submit']"))
+         .desc("Wikipedia search button")
+         .single()
+         .await?;
      elem_button.click().await?;
 
-     // Look for header to implicitly wait for the page to load.
-     driver.find(By::ClassName("firstHeading")).await?;
+     // Wait for the unique article heading before checking the title.
+     driver
+         .query(By::ClassName("firstHeading"))
+         .desc("Wikipedia article heading")
+         .single()
+         .await?;
      assert_eq!(driver.title().await?, "Selenium - Wikipedia");
 
      // Always explicitly close the browser.
@@ -76,6 +100,33 @@ async fn main() -> WebDriverResult<()> {
      Ok(())
 }
 ```
+
+For test functions, prefer
+[`run_browser_test`](https://docs.rs/thirtyfour/latest/thirtyfour/testing/fn.run_browser_test.html).
+It attempts `driver.quit().await` after successful tests, early error returns,
+and panicking assertions, and preserves both errors when the test and cleanup
+fail. Call `quit()` directly for application flows that do not use the runner.
+
+### Prefer stable selectors
+
+When you control the application under test, give important elements stable
+`data-testid` hooks and select them with `By::Testid`:
+
+```rust
+let save_button = driver
+    .query(By::Testid("settings-save"))
+    .desc("settings save button")
+    .single()
+    .await?;
+```
+
+Prefer app-owned test IDs first, then stable semantic CSS selectors. Match
+visible text when the copy itself is part of the behavior you are testing, and
+use XPath only when CSS cannot reasonably express the target. The Wikipedia
+example above uses the stable selectors that third-party page actually exposes.
+
+See the [Element Queries](https://stevepryde.github.io/thirtyfour/features/queries.html)
+chapter for the full selector guidance.
 
 ## Minimum Supported Rust Version
 

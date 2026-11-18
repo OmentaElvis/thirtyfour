@@ -13,7 +13,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use thirtyfour::manager::WebDriverManager;
+use thirtyfour::manager::{BrowserKind, WebDriverManager};
 use thirtyfour::prelude::*;
 use thirtyfour::{ChromeCapabilities, EdgeCapabilities, FirefoxCapabilities};
 
@@ -73,10 +73,73 @@ fn edge_caps() -> EdgeCapabilities {
 async fn managed_chrome_smoke() -> WebDriverResult<()> {
     with_timeout(async {
         let driver = WebDriver::managed(chrome_caps()).await?;
+        let server_url = driver.server_url().clone();
         if !skip_navigation() {
             driver.goto("about:blank").await?;
         }
         driver.quit().await?;
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "quit().await must not return while chromedriver is still listening"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_chrome_verbose_logs_reach_startup_subscriber() -> WebDriverResult<()> {
+    with_timeout(async {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = WebDriver::managed(chrome_caps())
+            .driver_arg(BrowserKind::Chrome, "--verbose")
+            // ChromeDriver rejects this log level if arguments leak across browsers.
+            .driver_arg(BrowserKind::Firefox, "--log-level=invalid")
+            .on_driver_log(move |line| {
+                let _ = tx.send(line.line.clone());
+            })
+            .await?;
+
+        // InitSession is logged by ChromeDriver only with verbose logging.
+        // It runs before the builder returns, so a session-level callback would miss it.
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(line) = rx.recv().await {
+                if line.contains("COMMAND InitSession") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        driver.quit().await?;
+        assert!(matches!(received, Ok(true)), "missing ChromeDriver verbose startup log");
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_chrome_multiple_driver_args_write_verbose_log_file() -> WebDriverResult<()> {
+    with_timeout(async {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join("driver log with spaces.txt");
+        let mut log_arg = std::ffi::OsString::from("--log-path=");
+        log_arg.push(&log_path);
+        let builder = WebDriverManager::builder()
+            .driver_arg(BrowserKind::Chrome, "--verbose")
+            .driver_arg(BrowserKind::Chrome, log_arg);
+        let manager = builder.clone().build();
+        let driver = manager.launch(chrome_caps()).await?;
+        driver.quit().await?;
+
+        // The file's presence and command details independently prove that both
+        // arguments survived cloning and spawning, with the path kept as one argument.
+        let log =
+            std::fs::read_to_string(&log_path).expect("ChromeDriver should create the log file");
+        assert!(
+            log.contains("COMMAND InitSession"),
+            "log file should contain verbose startup logs"
+        );
         Ok(())
     })
     .await
@@ -88,6 +151,45 @@ async fn managed_firefox_smoke() -> WebDriverResult<()> {
         let driver = WebDriver::managed(firefox_caps()).await?;
         driver.goto("about:blank").await?;
         driver.quit().await?;
+        Ok(())
+    })
+    .await
+}
+
+/// `.latest()` online resolves the newest geckodriver release on GitHub and
+/// downloads it; offline, against the same cache, it picks that same driver.
+#[tokio::test(flavor = "multi_thread")]
+async fn managed_firefox_latest_online_then_offline() -> WebDriverResult<()> {
+    use std::sync::{Arc, Mutex};
+    use thirtyfour::manager::Status;
+
+    with_timeout(async {
+        let cache = tempfile::tempdir()?;
+        let mut resolved = Vec::new();
+        for offline in [false, true] {
+            let version = Arc::new(Mutex::new(None));
+            let manager = WebDriverManager::builder()
+                .latest()
+                .offline_mode(offline)
+                .cache_dir(cache.path().to_path_buf())
+                .on_status({
+                    let version = Arc::clone(&version);
+                    move |status| {
+                        if let Status::DriverVersionResolved {
+                            version: v,
+                            ..
+                        } = status
+                        {
+                            *version.lock().unwrap() = Some(v.clone());
+                        }
+                    }
+                })
+                .build();
+            let driver = manager.launch(firefox_caps()).await?;
+            driver.quit().await?;
+            resolved.push(version.lock().unwrap().take().expect("no DriverVersionResolved"));
+        }
+        assert_eq!(resolved[0], resolved[1]);
         Ok(())
     })
     .await
@@ -164,7 +266,40 @@ async fn managed_chrome_options_and_dedup() -> WebDriverResult<()> {
         }
 
         d1.quit().await?;
+        assert!(
+            driver_is_listening(d2.server_url()).await,
+            "quitting one shared session must keep chromedriver alive"
+        );
+        let server_url = d2.server_url().clone();
         d2.quit().await?;
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "quitting the final shared session must await chromedriver exit"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Concurrent explicit cleanup of every session sharing one chromedriver must
+/// still leave exactly one caller responsible for awaiting process exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_quit_awaits_shared_chromedriver_exit() -> WebDriverResult<()> {
+    with_timeout(async {
+        let mgr = WebDriverManager::builder().build();
+        let d1 = mgr.launch(chrome_caps()).await?;
+        let d2 = mgr.launch(chrome_caps()).await?;
+        let server_url = d1.server_url().clone();
+        assert_eq!(d2.server_url(), &server_url);
+
+        let (r1, r2) = tokio::join!(d1.quit(), d2.quit());
+        r1?;
+        r2?;
+
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "concurrent quit().await calls must await the shared chromedriver exit"
+        );
         Ok(())
     })
     .await

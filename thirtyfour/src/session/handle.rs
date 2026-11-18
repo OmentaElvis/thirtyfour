@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use serde_json::Value;
 use std::fmt::{Debug, Display, Formatter};
 use std::future::Future;
@@ -14,6 +15,7 @@ use crate::common::config::WebDriverConfig;
 use crate::common::cookie::Cookie;
 use crate::common::print::PrintParameters;
 use crate::error::WebDriverResult;
+use crate::extensions::query::IntoElementPoller;
 use crate::prelude::WebDriverError;
 use crate::session::scriptret::ScriptRet;
 use crate::support::base64_decode;
@@ -39,8 +41,8 @@ pub struct SessionHandle {
     /// are read from here for CDP WebSocket discovery; W3C `webSocketUrl`
     /// for BiDi).
     capabilities: Arc<Capabilities>,
-    /// The config used by this instance.
-    config: WebDriverConfig,
+    /// Atomically replaceable config used by this instance.
+    config: ArcSwap<WebDriverConfig>,
     /// quit session flag
     quit: Arc<OnceCell<()>>,
     /// Lazily-connected WebDriver BiDi handle, shared by every clone of the
@@ -82,7 +84,7 @@ impl SessionHandle {
             server_url: Arc::new(server_url.into_url()?),
             session_id,
             capabilities: Arc::new(capabilities),
-            config,
+            config: ArcSwap::from_pointee(config),
             quit: Arc::new(OnceCell::new()),
             #[cfg(feature = "bidi")]
             bidi: Arc::new(OnceCell::new()),
@@ -102,7 +104,7 @@ impl SessionHandle {
             quit: Arc::clone(&self.quit),
             #[cfg(feature = "bidi")]
             bidi: Arc::clone(&self.bidi),
-            config,
+            config: ArcSwap::from_pointee(config),
             driver_guard: self.driver_guard.clone(),
         }
     }
@@ -145,21 +147,48 @@ impl SessionHandle {
         &self.server_url
     }
 
-    /// The configuration used by this instance.
+    /// Return a snapshot of the configuration currently used by this session.
     ///
-    /// NOTE: It's sometimes useful to have separate instances pointing at the same
-    ///       underlying browser session but using different configurations.
-    ///       See [`WebDriver::clone_with_config()`] for more details.
+    /// The returned [`Arc`] keeps this snapshot alive if another task replaces
+    /// the session configuration.
+    pub fn config(&self) -> Arc<WebDriverConfig> {
+        self.config.load_full()
+    }
+
+    /// Atomically replace the configuration used by this session.
     ///
-    /// [`WebDriver::clone_with_config()`]: crate::WebDriver::clone_with_config()
-    pub fn config(&self) -> &WebDriverConfig {
-        &self.config
+    /// The new configuration is shared by all [`WebDriver`](crate::WebDriver)
+    /// clones and [`WebElement`]s associated with this session. Existing
+    /// [`ElementQuery`](crate::extensions::query::ElementQuery) and
+    /// [`ElementWaiter`](crate::extensions::query::ElementWaiter) values keep
+    /// the poller they were created with.
+    ///
+    /// Changing [`WebDriverConfig::request_timeout`] does not reconfigure the
+    /// existing HTTP client. Its timeout is fixed when the client is created.
+    pub fn set_config(&self, config: WebDriverConfig) {
+        self.config.store(Arc::new(config));
+    }
+
+    /// Atomically replace the default element poller used by this session.
+    ///
+    /// The new poller is shared by all [`WebDriver`](crate::WebDriver) clones
+    /// and [`WebElement`]s associated with this session. Existing
+    /// [`ElementQuery`](crate::extensions::query::ElementQuery) and
+    /// [`ElementWaiter`](crate::extensions::query::ElementWaiter) values keep
+    /// the poller they were created with.
+    pub fn set_poller(&self, poller: Arc<dyn IntoElementPoller + Send + Sync>) {
+        self.config.rcu(|current| {
+            let mut config = current.as_ref().clone();
+            config.poller = Arc::clone(&poller);
+            config
+        });
     }
 
     /// Send the specified command to the webdriver server.
     pub async fn cmd(&self, command: impl FormatRequestData) -> WebDriverResult<CmdResponse> {
         let request_data = command.format_request(&self.session_id);
-        run_webdriver_cmd(&*self.client, &request_data, &self.server_url, &self.config).await
+        let config = self.config();
+        run_webdriver_cmd(&*self.client, &request_data, &self.server_url, config.as_ref()).await
     }
 
     /// Get the WebDriver status.
@@ -1199,6 +1228,9 @@ impl SessionHandle {
         self.quit
             .get_or_try_init(|| async { self.cmd(Command::DeleteSession).await.map(drop) })
             .await?;
+        if let Some(driver_guard) = &self.driver_guard {
+            driver_guard.release().await?;
+        }
         Ok(())
     }
 
@@ -1253,7 +1285,7 @@ impl Drop for SessionHandle {
             quit: Arc::clone(&self.quit),
             session_id: self.session_id.clone(),
             capabilities: Arc::clone(&self.capabilities),
-            config: self.config.clone(),
+            config: ArcSwap::from(self.config.load_full()),
             #[cfg(feature = "bidi")]
             bidi: Arc::clone(&self.bidi),
             // The guard stays on the *original* SessionHandle so it drops after
@@ -1308,5 +1340,163 @@ impl Drop for SessionHandle {
             });
         })
         .join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use http::{Request, Response};
+
+    use super::*;
+    use crate::extensions::query::{
+        ElementPollerNoWait, ElementPollerWithTimeout, IntoElementPoller,
+    };
+    use crate::session::http::{Body, HttpClient};
+    use crate::{Capabilities, WebDriver};
+
+    struct UnusedClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for UnusedClient {
+        async fn send(&self, _: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            unreachable!("configuration tests do not issue WebDriver commands")
+        }
+
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(Self)
+        }
+    }
+
+    fn test_driver() -> WebDriver {
+        let handle = Arc::new(
+            SessionHandle::new_with_config_guard_and_caps(
+                Arc::new(UnusedClient),
+                "http://localhost:4444",
+                SessionId::from("config-test-session"),
+                WebDriverConfig::default(),
+                None,
+                Capabilities::new(),
+            )
+            .unwrap(),
+        );
+        handle.leak().unwrap();
+        WebDriver {
+            handle,
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CountingGuard(std::sync::atomic::AtomicUsize);
+
+    impl DriverGuard for CountingGuard {
+        fn release(
+            &self,
+        ) -> std::pin::Pin<Box<dyn Future<Output = WebDriverResult<()>> + Send + '_>> {
+            Box::pin(async {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    struct FailingDelete;
+
+    #[async_trait::async_trait]
+    impl HttpClient for FailingDelete {
+        async fn send(&self, _: Request<Body<'_>>) -> WebDriverResult<Response<Bytes>> {
+            Err(WebDriverError::FatalError("DELETE failed".into()))
+        }
+        async fn new(&self) -> Arc<dyn HttpClient> {
+            Arc::new(Self)
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_delete_keeps_guard_for_retry() {
+        let guard = Arc::new(CountingGuard::default());
+        let handle = SessionHandle::new_with_config_guard_and_caps(
+            Arc::new(FailingDelete),
+            "http://localhost:4444",
+            SessionId::from("failed-delete"),
+            WebDriverConfig::default(),
+            Some(guard.clone()),
+            Capabilities::new(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(handle.quit().await.unwrap_err().to_string().contains("DELETE failed"));
+            assert!(!handle.quit.initialized());
+            assert_eq!(guard.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+        handle.leak().unwrap(); // Avoid synchronous teardown in this mock test.
+    }
+
+    #[test]
+    fn leak_skips_delete_and_async_guard_release() {
+        let guard = Arc::new(CountingGuard::default());
+        let handle = SessionHandle::new_with_config_guard_and_caps(
+            Arc::new(UnusedClient),
+            "http://localhost:4444",
+            SessionId::from("leaked-session"),
+            WebDriverConfig::default(),
+            Some(guard.clone()),
+            Capabilities::new(),
+        )
+        .unwrap();
+        handle.leak().unwrap();
+        drop(handle);
+        assert_eq!(guard.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&guard), 1, "leak does not retain the managed lease");
+    }
+
+    #[test]
+    fn config_updates_are_shared_by_driver_clones() {
+        let driver = test_driver();
+        let clone = driver.clone();
+        let poller: Arc<dyn IntoElementPoller + Send + Sync> = Arc::new(ElementPollerNoWait);
+
+        driver.set_poller(Arc::clone(&poller));
+
+        let config = clone.config();
+        assert!(Arc::ptr_eq(&config.poller, &poller));
+        assert_eq!(config.request_timeout, Duration::from_secs(120));
+
+        let replacement_poller: Arc<dyn IntoElementPoller + Send + Sync> =
+            Arc::new(ElementPollerWithTimeout::default());
+        let replacement = WebDriverConfig::builder()
+            .keep_alive(false)
+            .poller(Arc::clone(&replacement_poller))
+            .request_timeout(Duration::from_secs(42))
+            .build()
+            .unwrap();
+
+        clone.set_config(replacement);
+
+        let config = driver.config();
+        assert!(!config.keep_alive);
+        assert_eq!(config.request_timeout, Duration::from_secs(42));
+        assert!(Arc::ptr_eq(&config.poller, &replacement_poller));
+    }
+
+    #[test]
+    fn session_handle_setters_update_the_shared_config() {
+        let driver = test_driver();
+        let handle = Arc::clone(driver.handle());
+        let poller: Arc<dyn IntoElementPoller + Send + Sync> = Arc::new(ElementPollerNoWait);
+
+        handle.set_poller(Arc::clone(&poller));
+        assert!(Arc::ptr_eq(&driver.config().poller, &poller));
+
+        let replacement = WebDriverConfig::builder()
+            .keep_alive(false)
+            .request_timeout(Duration::from_secs(7))
+            .build()
+            .unwrap();
+        handle.set_config(replacement);
+
+        let config = driver.config();
+        assert!(!config.keep_alive);
+        assert_eq!(config.request_timeout, Duration::from_secs(7));
     }
 }

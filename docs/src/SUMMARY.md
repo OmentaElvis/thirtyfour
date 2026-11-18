@@ -5,8 +5,16 @@
 # Getting Started
 - [Installation](./getting-started/installation.md)
 - [Your First Browser Automation Code](./getting-started/first-code.md)
+- [AI/LLM Quickstart](./getting-started/ai-quickstart.md)
 - [Explaining The Code](./getting-started/explaining-the-code.md)
+- [Reliable AI-Generated Tests](./getting-started/reliable-tests.md)
 - [Feature Flags](./getting-started/feature-flags.md)
+# Recipes
+- [Recipe Conventions](./recipes/index.md)
+- [Forms And Page Content](./recipes/forms-and-content.md)
+- [Frames, Shadow DOM, And Files](./recipes/browser-contexts.md)
+- [Failure Artifacts And Logs](./recipes/diagnostics.md)
+- [CDP And BiDi](./recipes/browser-protocols.md)
 # Feature Documentation
 - [Element Queries](./features/queries.md)
 - [Waiting For Element Changes](./features/waiting.md)
@@ -20,6 +28,7 @@
 - [BiDi Events](./bidi/events.md)
 # Useful Tools
 - [Selenium](./tools/selenium.md)
+- [Translating Selenium And Playwright](./tools/selenium-playwright.md)
 # Contributing
 - [Running Tests For Thirtyfour](./contributing/testing.md)
 # Appendix

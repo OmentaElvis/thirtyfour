@@ -108,7 +108,21 @@ fn manager_for(browser: &str) -> &'static Arc<WebDriverManager> {
         "firefox" => &FIREFOX,
         b => unimplemented!("unsupported browser backend {b}"),
     };
-    cell.get_or_init(|| WebDriverManager::builder().build())
+    cell.get_or_init(|| {
+        let builder = WebDriverManager::builder();
+        let builder = if browser == "chrome" && github_actions() {
+            builder.on_driver_log(|line| {
+                eprintln!("ChromeDriver {} {}: {}", line.driver_id, line.stream, line.line);
+            })
+        } else {
+            builder
+        };
+        builder.build()
+    })
+}
+
+fn github_actions() -> bool {
+    std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true")
 }
 
 /// Launch the specified browser via the shared per-binary [`WebDriverManager`].
@@ -116,7 +130,9 @@ pub async fn launch_browser(browser: &str) -> WebDriver {
     tracing::debug!("launching browser {browser}");
     let mgr = manager_for(browser);
     match browser {
-        "chrome" => mgr.launch(make_chrome_caps()).await.expect("Failed to launch chrome"),
+        "chrome" => {
+            launch_managed_chrome(make_chrome_caps()).await.expect("Failed to launch chrome")
+        }
         "firefox" => mgr.launch(make_firefox_caps()).await.expect("Failed to launch firefox"),
         b => unimplemented!("unsupported browser backend {b}"),
     }

@@ -49,8 +49,53 @@ Pass any of these `By` variants to `query()`:
 | `By::PartialLinkText("...")` | `<a>` whose visible text contains the string |
 | `By::Testid("...")`   | Element with `data-testid="..."`         |
 
-`By::Css` and `By::XPath` are the most expressive; the others are
-convenience wrappers and most are implemented as CSS under the hood.
+`By::Css` can express compound CSS selectors, while `By::XPath` covers
+relationships CSS cannot represent. The other variants are convenient,
+purpose-specific selectors, and most are implemented as CSS under the hood.
+
+## Choosing Stable Selectors
+
+Use selectors in this order when the application gives you the choice:
+
+1. **App-owned test IDs.** Add a stable `data-testid` to important controls and
+   select it with `By::Testid`. This keeps tests independent of styling and
+   displayed copy.
+2. **Stable semantic CSS.** When no test ID exists, target durable attributes
+   and element roles, such as `button[type='submit']`, rather than generated
+   classes or a long chain of DOM positions.
+3. **Visible text when the copy is the behavior.** Text matching is useful for
+   verifying an error message, heading, or labeled action. It is brittle as a
+   default element identity because copy changes, localization, and duplicate
+   labels can break an otherwise-correct flow.
+4. **XPath only when CSS cannot express the target.** XPath is useful for
+   relationships or document structures CSS cannot select, but is usually
+   harder to read and easier to couple to the current DOM.
+
+For an app-owned test hook:
+
+```rust
+let save_button = driver
+    .query(By::Testid("settings-save"))
+    .desc("settings save button")
+    .single()
+    .await?;
+```
+
+Use a strong selector before a text filter when the visible wording also
+matters:
+
+```rust
+let status = driver
+    .query(By::Testid("settings-status"))
+    .with_text("Saved")
+    .desc("saved settings status")
+    .single()
+    .await?;
+```
+
+`By::Testid` targets the conventional `data-testid` attribute. Teams that use
+another app-owned attribute can express it with CSS, for example
+`By::Css("[data-qa='settings-save']")`.
 
 ## Picking An Element
 
@@ -66,8 +111,9 @@ the one that matches what you actually need:
 | `.all_from_selector_required().await?`  | Same, but errors if empty.                             |
 | `.any().await?`                         | Elements from every branch combined, possibly empty.   |
 | `.any_required().await?`                | Same, but errors if empty.                             |
-| `.exists().await?`                      | `bool` — does it exist?                                |
-| `.not_exists().await?`                  | `bool` — does it stay absent for the timeout?          |
+| `.exists().await?`                      | Waits for a match; returns `false` on timeout.          |
+| `.not_exists().await?`                  | Waits for no matches; returns `false` on timeout.       |
+| `.wait_until_gone().await?`             | Waits for no matches; timeout is an error.              |
 
 `.any()` and `.all_from_selector()` differ when you've used `.or()`:
 `.any()` runs every branch and returns the union of matches;
@@ -122,7 +168,7 @@ for partial / case-insensitive / word-boundary matches:
 use thirtyfour::stringmatch::StringMatchable;
 
 let btn = driver
-    .query(By::Tag("button"))
+    .query(By::Testid("account-submit"))
     .with_text("Submit".match_partial().case_insensitive())
     .first()
     .await?;
@@ -143,8 +189,9 @@ Available filter families (each has a `with_*` and a `without_*` form):
   `.with_css_properties(...)`
 
 Each filter triggers an extra WebDriver round trip per poll iteration,
-so prefer narrowing the initial `By` selector when you can. CSS and
-XPath are usually the right tool for complex matches.
+so prefer narrowing the initial `By` selector when you can. Start with an
+app-owned test ID or stable CSS selector, add filters only for behavior the
+test needs to verify, and reserve XPath for targets CSS cannot express.
 
 ## Custom Predicates
 
@@ -182,7 +229,30 @@ immediately):
 
 ```rust
 let exists = driver.query(By::Id("maybe")).nowait().exists().await?;
+let absent = driver.query(By::Id("maybe")).nowait().not_exists().await?;
 ```
+
+Each branch is attempted at most once with `.nowait()`. `exists()` may stop at
+the first matching branch; `not_exists()` must check every branch because all
+of them must be absent. Without `.nowait()`, `not_exists()` polls until the
+query has no matches and returns `false` if matches remain when polling ends.
+
+When disappearance is required rather than optional, use the error-returning
+form:
+
+```rust
+driver
+    .query(By::Testid("saving-indicator"))
+    .desc("saving indicator")
+    .wait_until_gone()
+    .await?;
+```
+
+“Gone” means no element currently matches any branch after that branch's
+filters in the query's source context. A replacement node that still matches
+keeps the query waiting. This returns immediately when the query is already
+absent and returns a `WebDriverError::Timeout` if any branch still matches at
+the deadline.
 
 The default poller is 20 seconds with 500ms intervals. To change it for
 the whole `WebDriver`, supply a custom `WebDriverConfig` — see

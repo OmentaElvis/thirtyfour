@@ -20,7 +20,7 @@ Suppose your page contains a search form:
 ```html
 <form id="search-form">
     <input type="text" id="search-input" />
-    <button type="submit">Search</button>
+    <button type="submit" data-testid="search-submit">Search</button>
 </form>
 ```
 
@@ -28,14 +28,13 @@ Wrap it in a Component:
 
 ```rust
 use thirtyfour::prelude::*;
-use thirtyfour::components::ElementResolver;
 
 #[derive(Debug, Clone, Component)]
 pub struct SearchForm {
     base: WebElement,                              // The <form> itself.
     #[by(id = "search-input")]
     input: ElementResolver<WebElement>,            // The <input>.
-    #[by(css = "button[type='submit']")]
+    #[by(testid = "search-submit", description = "search submit button")]
     submit: ElementResolver<WebElement>,           // The <button>.
 }
 
@@ -65,48 +64,112 @@ A few things are happening here:
 - Each `#[by(...)]` field is an `ElementResolver`. It doesn't query
   anything until you call `.resolve()`, and it caches the result so
   subsequent calls don't hit WebDriver again.
-- Resolvers always search relative to `base`, so a `SearchForm` can
-  only ever find elements inside its own `<form>`. That scoping is one
-  of the big wins over scattered `driver.query(...)` calls — you can't
-  accidentally match elements from a different form on the page.
+- Resolver queries start from `base`, so components normally stay scoped
+  to their own subtree. XPath is the exception: an expression beginning
+  with `//` is document-rooted. Use `.//` when an XPath resolver must stay
+  inside the component.
+
+## Component Shape And Generated API
+
+`Component` can only be derived for a struct with named fields. The struct
+must contain exactly one base `WebElement`:
+
+```rust
+#[derive(Debug, Clone, Component)]
+pub struct Dialog {
+    #[base]
+    root: WebElement,
+}
+```
+
+A field named `base` is detected automatically. Use `#[base]` when the
+field has another name. Do not use both forms in the same struct; the
+derive rejects multiple base fields. The base field type must be
+`WebElement` (either imported or written as `thirtyfour::WebElement`).
+
+For each component, the derive generates:
+
+- `pub fn new(base: WebElement) -> Self`;
+- `From<WebElement>`, which delegates to `new`;
+- the `Component` trait implementation, including `base_element()`.
+
+Fields with `#[by(...)]` become element resolvers. Other fields are
+initialised with `Default::default()`, so each such field type must implement
+`Default`. A `#[cfg(...)]` attribute on a field is preserved in the generated
+constructor, allowing feature- or target-specific resolver and state fields.
 
 ## The `#[by(...)]` Attribute
 
-Every resolver field needs a `#[by(...)]` attribute. The first part
-picks the selector:
+Every resolver field needs one `#[by(...)]` attribute. Use either exactly
+one selector or one custom resolver. Selector and `description` values must
+be string literals.
 
-| Attribute            | Selector used    |
-| -------------------- | ---------------- |
-| `id = "..."`         | `By::Id`         |
-| `css = "..."`        | `By::Css`        |
-| `xpath = "..."`      | `By::XPath`      |
-| `tag = "..."`        | `By::Tag`        |
-| `class = "..."`      | `By::ClassName`  |
-| `name = "..."`       | `By::Name`       |
-| `link = "..."`       | `By::LinkText`   |
-| `testid = "..."`     | `By::Testid`     |
+| Attribute                | Selector used          |
+| ------------------------ | ---------------------- |
+| `id = "..."`             | `By::Id`               |
+| `css = "..."`            | `By::Css`              |
+| `xpath = "..."`          | `By::XPath`            |
+| `tag = "..."`            | `By::Tag`              |
+| `class = "..."`          | `By::ClassName`        |
+| `name = "..."`           | `By::Name`             |
+| `link = "..."`           | `By::LinkText`         |
+| `partial_link = "..."`   | `By::PartialLinkText`  |
+| `testid = "..."`         | `By::Testid`           |
 
-Pair the selector with extra options, comma-separated. Which options
-apply depends on whether the resolver is single or multi (the macro
-infers that from the field type — `ElementResolver<T>` is single,
-`ElementResolver<Vec<T>>` is multi):
+All selectors start a query from the component's base element. For XPath,
+remember that `//div` searches from the document root while `.//div` searches
+within the base element.
 
-| Option                     | Applies to | Effect                                                    |
-| -------------------------- | ---------- | --------------------------------------------------------- |
-| `single`                   | single     | Match exactly one element. Errors if 0 or 2+. Default.    |
-| `first`                    | single     | Match the first element instead.                          |
-| `not_empty`                | multi      | Match at least one element. Errors if empty. Default.     |
-| `allow_empty`              | multi      | Match zero or more elements. Empty Vec is OK.             |
-| `description = "..."`      | both       | Attach a label that shows up in timeout error messages.   |
-| `wait(timeout_ms = N, interval_ms = N)` | both | Override the poll cadence for this field.            |
-| `nowait`                   | both       | Try once without polling.                                 |
-| `ignore_errors`            | both       | Forward `ignore_errors` to the underlying query.          |
-| `multi`                    | multi      | Force multi-resolver behaviour. Only needed for custom type aliases. |
-| `custom = my_resolver_fn`  | both       | Use a custom resolver function (see [Custom Resolvers](#custom-resolvers)). Mutually exclusive with the other options. |
+### Resolver Types And Cardinality
+
+Built-in selector resolvers can return `WebElement`, a nested `Component`, or
+a `Vec` of either. The macro infers single- versus multi-element behaviour from
+the field type:
+
+| Field type                        | Inferred mode | Default cardinality |
+| --------------------------------- | ------------- | ------------------- |
+| `ElementResolver<T>`              | single        | exactly one         |
+| `ElementResolver<Vec<T>>`         | multi         | one or more         |
+| `ElementResolverSingle`           | single        | exactly one         |
+| `ElementResolverMulti`            | multi         | one or more         |
+| user-defined resolver type alias   | single        | use `multi` to force multi mode |
+
+Here, `T` is either `WebElement` or a type implementing `Component + Clone`.
+Nested components are constructed from each matched `WebElement` through
+their generated `From<WebElement>` implementation.
+
+`ElementResolver<Vec<T>>` is detected through the normal `ElementResolver`,
+`components::ElementResolver`, and `thirtyfour::components::ElementResolver`
+paths. If a type alias hides the `Vec`, add the `multi` option. The convenience
+alias `ElementResolverMulti` is also detected when used directly.
+
+### Query Options
+
+Pair a selector with options, separated by commas:
+
+| Option                                      | Applies to | Effect |
+| ------------------------------------------- | ---------- | ------ |
+| `single`                                    | single     | Require exactly one match. This is the default. |
+| `first`                                     | single     | Return the first match instead of requiring uniqueness. |
+| `not_empty`                                 | multi      | Require one or more matches. This is the default. |
+| `allow_empty`                               | multi      | Return all matches, including an empty `Vec`. |
+| `multi`                                     | multi      | Force multi mode when a type alias hides `Vec<T>`. |
+| `description = "..."`                       | both       | Include a human-readable label in query errors. |
+| `ignore_errors`                             | both       | Ignore query errors while polling and keep trying until the timeout. |
+| `wait(timeout_ms = N, interval_ms = N)`     | both       | Override both the polling timeout and interval. Both arguments are required. |
+| `nowait`                                    | both       | Poll once instead of waiting. |
+
+The default mode uses the query system's default polling configuration.
+`single` and `first` are mutually exclusive, as are `not_empty` and
+`allow_empty`, and `wait(...)` and `nowait`. Single-only options cannot be
+used for a multi resolver, and multi-only options cannot be used for a single
+resolver. The derive also rejects repeated options and multiple selectors.
 
 Examples:
 
 ```rust
+type LinkListResolver = ElementResolver<Vec<WebElement>>;
+
 // Use the first match if there are several.
 #[by(id = "search-input", first)]
 input: ElementResolver<WebElement>,
@@ -119,6 +182,10 @@ items: ElementResolver<Vec<WebElement>>,
 #[by(css = ".loading-spinner", description = "loading spinner",
      wait(timeout_ms = 60_000, interval_ms = 1_000))]
 spinner: ElementResolver<WebElement>,
+
+// A custom alias that contains ElementResolver<Vec<WebElement>>.
+#[by(partial_link = "Guide", multi, allow_empty)]
+guide_links: LinkListResolver,
 ```
 
 ## ElementResolver Methods
@@ -133,15 +200,53 @@ Every resolver field exposes the same handful of methods:
 | `.invalidate()`              | Drop the cache without querying. The next `.resolve()` will run the query again.     |
 | `.validate().await?`         | Return the cached value if it's still in the DOM, or `None`.                         |
 
+An `ElementResolver<WebElement>` also provides common element operations
+directly. Each method calls `resolve_present()` first, then forwards to the
+resolved `WebElement`:
+
+| Method                              | Returns                         | Behaviour                                             |
+| ----------------------------------- | ------------------------------- | ----------------------------------------------------- |
+| `.click().await?`                   | `()`                            | Resolve a present element and click it.                |
+| `.click_when_ready().await?`        | `()`                            | Resolve, wait until displayed and enabled, then click. |
+| `.clear().await?`                   | `()`                            | Resolve and clear the element's contents.              |
+| `.send_keys(value).await?`          | `()`                            | Resolve and send keys to the element.                  |
+| `.text().await?`                    | `String`                        | Resolve and return its rendered text.                  |
+| `.value().await?`                   | `Option<String>`                | Resolve and return its `value` property.               |
+
+The resolver receiver makes the re-resolution behavior part of the API, so the
+methods deliberately use the same names as `WebElement`:
+
+```rust
+self.email.clear().await?;
+self.email.send_keys("ada@example.test").await?;
+self.submit.click_when_ready().await?;
+```
+
+These helpers validate and potentially re-query once before the operation.
+They do not retry the operation if the page changes afterward or wait for an
+application outcome.
+They are available only on `ElementResolver<WebElement>`, not resolvers of a
+Component, `Vec`, or another custom type. Each call validates independently. If
+two operations must target exactly the same node, resolve once instead:
+
+```rust
+let email = self.email.resolve_present().await?;
+email.clear().await?;
+email.send_keys("ada@example.test").await?;
+```
+
 Two macros wrap the most common calls:
 
 ```rust
+use thirtyfour::{resolve, resolve_present};
+
 let elem = resolve!(self.input);            // self.input.resolve().await?
 let elem = resolve_present!(self.input);    // self.input.resolve_present().await?
 ```
 
 The macros are useful for chained method calls without scattering
-`.await?` around:
+`.await?` around. They are exported from the crate root instead of the
+prelude so broad macro names do not get glob-imported accidentally:
 
 ```rust
 resolve!(self.submit).click().await?;
@@ -221,7 +326,7 @@ Fields without a `#[by(...)]` attribute are initialised via
 extra boilerplate:
 
 ```rust
-#[derive(Debug, Clone, Component, Default)]
+#[derive(Debug, Clone, Component)]
 pub struct LoginForm {
     base: WebElement,
     #[by(id = "username")]
@@ -254,10 +359,30 @@ pub struct Header {
 }
 ```
 
-A custom resolver receives the component's base element and returns a
-`WebDriverResult<T>` matching the field's type. `custom = ...` is
-mutually exclusive with the selector and modifier options — the
-function is doing all of that work itself.
+A custom resolver receives the component's base element by value and returns
+a `WebDriverResult<T>` matching the field's `ElementResolver<T>` type. Pass a
+function path or another compatible expression, not a quoted string:
+
+```rust
+// Assume Row is another Component.
+async fn resolve_rows(base: WebElement) -> WebDriverResult<Vec<Row>> {
+    let elements = base.query(By::Css("tbody > tr")).all_from_selector().await?;
+    Ok(elements.into_iter().map(Row::from).collect())
+}
+
+#[derive(Debug, Clone, Component)]
+pub struct Table {
+    base: WebElement,
+    #[by(custom = resolve_rows)]
+    rows: ElementResolver<Vec<Row>>,
+}
+```
+
+The resolver function owns the complete lookup policy, including cardinality,
+polling, filtering, and error handling. Therefore `custom = ...` cannot be
+combined with a selector or any other `#[by(...)]` option. Single and `Vec`
+field types are still inferred normally; do not add `multi` to a custom
+resolver.
 
 ## When To Reach For A Component
 
@@ -283,3 +408,8 @@ For the full list of methods and attribute combinations, see:
   the `Component` trait, `ElementResolver`, and helper wrappers.
 - [`thirtyfour_macros::Component`](https://docs.rs/thirtyfour-macros/latest/thirtyfour_macros/derive.Component.html) —
   the derive macro and every supported attribute.
+
+With the default `component` feature enabled, `use thirtyfour::prelude::*;`
+imports the `Component` derive macro and `ElementResolver`. Import
+`resolve!` and `resolve_present!` explicitly from `thirtyfour` when you
+want the shorthand macros.
